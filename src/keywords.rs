@@ -255,7 +255,7 @@ pub const fn meme(name: &'static str) -> KeywordAction {
 }
 
 /// Одна строка таблицы, разобранная один раз при сборке.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Entry {
     /// Фраза как её видит человек и как её показывает панель.
     phrase: String,
@@ -301,20 +301,15 @@ impl KeywordTable {
             entries.push(entry(added.phrase.clone(), action, false));
         }
 
-        // Готовность действия считается по всей таблице: одна добавленная
-        // кириллическая фраза без ASCII не должна срабатывать.
-        let ready: Vec<bool> = entries
+        // Готовность считается по цели, а не по точному варианту действия:
+        // у бомжары встроенная фраза живёт в RandomMeme, а добавленная в
+        // Meme. Сравнение вариантов объявляло добавленную фразу вечно
+        // ждущей пары, хотя пара алфавитов у мема уже есть.
+        let flags: Vec<bool> = entries
             .iter()
-            .map(|entry| {
-                alphabet_pair_ok(
-                    entries
-                        .iter()
-                        .filter(|other| other.action == entry.action)
-                        .map(|other| other.phrase.as_str()),
-                )
-            })
+            .map(|entry| ready(&entries, &entry.needles, &entry.action))
             .collect();
-        for (entry, ready) in entries.iter_mut().zip(ready) {
+        for (entry, ready) in entries.iter_mut().zip(flags) {
             entry.pending = !ready;
         }
 
@@ -423,15 +418,10 @@ impl KeywordTable {
     }
 
     /// Есть ли у действия фразы обоих алфавитов. Встроенная таблица держит
-    /// это правило тестом, а правки из бота проверяются здесь: иначе бот
-    /// принял бы фразу, которая нарушает контракт.
+    /// это правило тестом, а удаление встроенной фразы проверяется здесь.
     pub fn action_has_both_alphabets(&self, action: &KeywordAction) -> bool {
-        alphabet_pair_ok(
-            self.entries
-                .iter()
-                .filter(|entry| &entry.action == action)
-                .map(|entry| entry.phrase.as_str()),
-        )
+        let needles = needles_for_action(action);
+        ready(&self.entries, &needles, action)
     }
 
     /// Фраза с таким ключом, ведущая к другому действию. Одинаковый ключ у
@@ -450,16 +440,47 @@ impl KeywordTable {
     }
 }
 
-fn entry(phrase: String, action: KeywordAction, builtin: bool) -> Entry {
-    let words = normalized_words(&phrase);
-    let key = words.concat();
-    let needles = match &action {
+/// Иглы действия в нормализованном виде. Пусто у `Grandmobile`: файла нет.
+fn needles_for_action(action: &KeywordAction) -> Vec<String> {
+    match action {
         KeywordAction::Grandmobile => Vec::new(),
         KeywordAction::Meme(needle) => vec![meme_key(needle)],
         KeywordAction::RandomMeme(needles) => {
             needles.iter().map(|needle| meme_key(needle)).collect()
         }
-    };
+    }
+}
+
+/// Есть ли у цели фразы обоих алфавитов. Цель это иглы действия: для `Meme`
+/// имя мема, для `RandomMeme` вся группа, для `Grandmobile` только он сам.
+/// Сравниваются иглы, а не вариант enum, иначе встроенная группа и
+/// добавленная фраза к тому же мему считаются разными действиями.
+fn ready(entries: &[Entry], needles: &[String], action: &KeywordAction) -> bool {
+    if needles.is_empty() {
+        return alphabet_pair_ok(
+            entries
+                .iter()
+                .filter(|other| &other.action == action)
+                .map(|other| other.phrase.as_str()),
+        );
+    }
+    alphabet_pair_ok(
+        entries
+            .iter()
+            .filter(|other| {
+                other
+                    .needles
+                    .iter()
+                    .any(|needle| needles.iter().any(|target| keys_cover(needle, target)))
+            })
+            .map(|other| other.phrase.as_str()),
+    )
+}
+
+fn entry(phrase: String, action: KeywordAction, builtin: bool) -> Entry {
+    let words = normalized_words(&phrase);
+    let key = words.concat();
+    let needles = needles_for_action(&action);
     Entry {
         phrase,
         words,
@@ -614,14 +635,19 @@ impl KeywordStore {
             return Err(format!("Фразы '{phrase}' нет в таблице."));
         }
 
-        let table = KeywordTable::build(&next);
-        let action = self
+        // Защищается только встроенная фраза: её исходник в коде, и молча
+        // выключить целое действие нельзя. Добавленную фразу можно убрать
+        // всегда: если пара алфавитов распадётся, действие просто станет
+        // pending и перестанет срабатывать, а не сломает таблицу.
+        let builtin_action = self
             .table()
             .entries
             .iter()
             .find(|entry| entry.phrase == phrase)
+            .filter(|entry| entry.builtin)
             .map(|entry| entry.action.clone());
-        if let Some(action) = action {
+        let table = KeywordTable::build(&next);
+        if let Some(action) = builtin_action {
             if !table.action_has_both_alphabets(&action) {
                 return Err(format!(
                     "После удаления '{phrase}' у действия не останется фразы \
@@ -1441,6 +1467,49 @@ mod edit_tests {
         assert_eq!(KeywordStore::load(path.clone()).edits().added.len(), 0);
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn added_phrase_can_be_removed_without_pair_breakage() {
+        // Добавленную фразу накрытого мема можно убрать: встроенная пара
+        // алфавитов остаётся, действие не ломается.
+        let mut store = store("remove-added");
+        store.add("царь", "bomjara1").unwrap();
+        let table = store.remove("царь").unwrap();
+
+        assert_eq!(table.match_keyword("царь"), None);
+        assert_eq!(
+            table.match_keyword("бомжара").map(|(_, action)| action),
+            Some(KeywordAction::RandomMeme(&["bomjara", "bomjaro"]))
+        );
+
+        let _ = std::fs::remove_dir_all(store.path.parent().unwrap());
+    }
+
+    #[test]
+    fn added_phrase_fires_for_meme_covered_by_builtin_aliases() {
+        // Случай из жизни: к бомжаре добавляют «царь» через панель. Мем уже
+        // покрыт встроенной группой RandomMeme, поэтому пара алфавитов у него
+        // есть, и новая фраза обязана срабатывать сразу, без второй фразы.
+        let edits = KeywordEdits {
+            added: vec![AddedPhrase {
+                phrase: "царь".to_string(),
+                meme: "bomjara1".to_string(),
+            }],
+            disabled: Vec::new(),
+        };
+        let table = KeywordTable::build(&edits);
+
+        assert_eq!(
+            table.match_keyword("царь").map(|(_, action)| action),
+            Some(KeywordAction::Meme(Cow::Owned("bomjara1".to_string()))),
+            "добавленная фраза не срабатывает"
+        );
+        // Уже существующие алиасы не сломались.
+        assert_eq!(
+            table.match_keyword("бомжара").map(|(_, action)| action),
+            Some(KeywordAction::RandomMeme(&["bomjara", "bomjaro"]))
+        );
     }
 
     #[test]

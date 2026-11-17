@@ -628,12 +628,9 @@ pub async fn handle_input(bot: &Bot, msg: &Message, data: &TgData, pending: Pend
             let result = data.keyword_store.lock().await.add(text, &meme);
             match result {
                 Ok(table) => {
-                    let ready = {
-                        let sources = table.phrase_sources_for_name(&meme);
-                        crate::keywords::alphabet_pair_ok(
-                            sources.iter().map(|(phrase, _, _)| *phrase),
-                        )
-                    };
+                    // Готовность спрашиваем у самого матчера, а не у списка
+                    // фраз: иначе панель скажет «готово», а бот промолчит.
+                    let ready = table.match_keyword(text.trim()).is_some();
                     *data.keywords.write().await = table;
                     let note = if ready {
                         format!("Добавлено к '{}'.", display_name(&meme))
