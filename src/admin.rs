@@ -364,7 +364,7 @@ pub async fn on_callback(bot: &Bot, query: &CallbackQuery, data: &TgData) -> boo
             bot.send_message(
                 chat,
                 append_hint(format!(
-                    "Фраза для мема '{}'.\nПришли одним сообщением. Любая команда отменит ввод.",
+                    "Фраза для мема '{}'.\nПришли одним сообщением.",
                     display_name(&meme.name)
                 )),
             )
@@ -422,8 +422,7 @@ pub async fn on_callback(bot: &Bot, query: &CallbackQuery, data: &TgData) -> boo
             let _ = bot.answer_callback_query(query.id.clone()).await;
             bot.send_message(
                 chat,
-                "Пришли числовой id или @username нового модератора.\n\
-                 Любая команда отменит ввод.",
+                append_hint("Пришли числовой id или @username нового модератора.".to_string()),
             )
             .await
             .ok();
